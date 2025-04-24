@@ -1,6 +1,6 @@
 import torch
 import pytest
-from DL_Project.code.diffusion import naive_sampling
+from diffusion import naive_sampling
 
 # Dummy restoration model: simply halves input
 
