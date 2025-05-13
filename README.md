@@ -52,3 +52,5 @@ We validated that cold diffusion can be a viable alternative to noise-based diff
 
 ## Aknowledgements
 This project serves as the authors' final project for Cornell University's CS 5782: Intro to Deep Learning. We thank Professor Sun and Professor Weinberger as well as the entire course staff for a great semester!
+
+We used ChatGPT-4o for generating graphs, as well as assistance with with preliminary testing. Final code is ours and the key architectures align with that of the paper.
