@@ -1,0 +1,903 @@
+import math
+import copy
+import torch
+from torch import nn, einsum
+import torch.nn.functional as F
+from inspect import isfunction
+from functools import partial
+
+from torch.utils import data
+from pathlib import Path
+from torch.optim import Adam
+from torchvision import datasets, transforms, utils
+
+import numpy as np
+from tqdm import tqdm
+from einops import rearrange
+
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+import shutil
+import torchvision
+from torchvision.datasets import MNIST, CIFAR10
+import pytorch_fid
+
+from skimage.metrics import structural_similarity as ssim
+from pytorch_fid import fid_score
+
+# colab setup
+from google.colab import drive
+drive.mount('/content/drive')
+res_dir = '/content/drive/MyDrive/Project'
+
+# helper funcs
+def exists(x):
+    return x is not None
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+def num_to_groups(num, divisor):
+    grps = num // divisor
+    leftover = num % divisor
+    arr = [divisor] * grps
+    if leftover > 0:
+        arr.append(leftover)
+    return arr
+
+# small helpers
+class EMA():
+    def __init__(self, beta):
+        super().__init__()
+        self.beta = beta
+
+    def update_model_average(self, ma_model, current_model):
+        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
+            old, new = ma_params.data, current_params.data
+            ma_params.data = self.update_average(old, new)
+
+    def update_average(self, old, new):
+        if old is None:
+            return new
+        return old * self.beta + (1 - self.beta) * new
+
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x, *args, **kwargs):
+        return self.fn(x, *args, **kwargs) + x
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        dev = x.device
+        half_d = self.dim // 2
+        emb = math.log(10000) / (half_d - 1)
+        emb = torch.exp(torch.arange(half_d, device=dev) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+def Upsample(dim):
+    return nn.ConvTranspose2d(dim, dim, 4, 2, 1)
+
+def Downsample(dim):
+    return nn.Conv2d(dim, dim, 4, 2, 1)
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+        self.g = nn.Parameter(torch.ones(1, dim, 1, 1))
+        self.b = nn.Parameter(torch.zeros(1, dim, 1, 1))
+
+    def forward(self, x):
+        var = torch.var(x, dim = 1, unbiased = False, keepdim = True)
+        mean = torch.mean(x, dim = 1, keepdim = True)
+        return (x - mean) / (var + self.eps).sqrt() * self.g + self.b
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = LayerNorm(dim)
+
+    def forward(self, x):
+        x = self.norm(x)
+        return self.fn(x)
+
+class ConvNextBlock(nn.Module):
+    # from that paper
+
+    def __init__(self, dim, dim_out, *, time_emb_dim = None, mult = 2, norm = True):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.GELU(),
+            nn.Linear(time_emb_dim, dim)
+        ) if exists(time_emb_dim) else None
+
+        self.ds_conv = nn.Conv2d(dim, dim, 7, padding = 3, groups = dim)
+
+        self.net = nn.Sequential(
+            LayerNorm(dim) if norm else nn.Identity(),
+            nn.Conv2d(dim, dim_out * mult, 3, padding = 1),
+            nn.GELU(),
+            nn.Conv2d(dim_out * mult, dim_out, 3, padding = 1)
+        )
+
+        self.res_conv = nn.Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
+
+    def forward(self, x, time_emb = None):
+        h = self.ds_conv(x)
+
+        if exists(self.mlp):
+            assert exists(time_emb), 'time emb must be passed in'
+            cond = self.mlp(time_emb)
+            h = h + rearrange(cond, 'b c -> b c 1 1')
+
+        h = self.net(h)
+        return h + self.res_conv(x)
+
+class LinearAttention(nn.Module):
+    def __init__(self, dim, heads = 4, dim_head = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_qkv = nn.Conv2d(dim, hidden_dim * 3, 1, bias = False)
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        qkv = self.to_qkv(x).chunk(3, dim = 1)
+        q, k, v = map(lambda t: rearrange(t, 'b (h c) x y -> b h c (x y)', h = self.heads), qkv)
+        q = q * self.scale
+
+        k = k.softmax(dim = -1)
+        ctx = torch.einsum('b h d n, b h e n -> b h d e', k, v)
+
+        out = torch.einsum('b h d e, b h d n -> b h e n', ctx, q)
+        out = rearrange(out, 'b h c (x y) -> b (h c) x y', h = self.heads, x = h, y = w)
+        return self.to_out(out)
+
+class Unet(nn.Module):
+    def __init__(
+        self,
+        dim,
+        out_dim = None,
+        dim_mults=(1, 2, 4, 8),
+        channels = 3,
+        with_time_emb = True,
+        residual = False
+    ):
+        super().__init__()
+        self.channels = channels
+        self.residual = residual
+        print("Is Time embed used ? ", with_time_emb)
+
+        dims = [channels, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        if with_time_emb:
+            time_dim = dim
+            self.time_mlp = nn.Sequential(
+                SinusoidalPosEmb(dim),
+                nn.Linear(dim, dim * 4),
+                nn.GELU(),
+                nn.Linear(dim * 4, dim)
+            )
+        else:
+            time_dim = None
+            self.time_mlp = None
+
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+        num_resolutions = len(in_out)
+
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.downs.append(nn.ModuleList([
+                ConvNextBlock(dim_in, dim_out, time_emb_dim = time_dim, norm = ind != 0),
+                ConvNextBlock(dim_out, dim_out, time_emb_dim = time_dim),
+                Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                Downsample(dim_out) if not is_last else nn.Identity()
+            ]))
+
+        mid_dim = dims[-1]
+        self.mid_block1 = ConvNextBlock(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_attn = Residual(PreNorm(mid_dim, LinearAttention(mid_dim)))
+        self.mid_block2 = ConvNextBlock(mid_dim, mid_dim, time_emb_dim = time_dim)
+
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (num_resolutions - 1)
+
+            self.ups.append(nn.ModuleList([
+                ConvNextBlock(dim_out * 2, dim_in, time_emb_dim = time_dim),
+                ConvNextBlock(dim_in, dim_in, time_emb_dim = time_dim),
+                Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                Upsample(dim_in) if not is_last else nn.Identity()
+            ]))
+
+        out_dim = default(out_dim, channels)
+        self.final_conv = nn.Sequential(
+            ConvNextBlock(dim, dim),
+            nn.Conv2d(dim, out_dim, 1)
+        )
+
+    def forward(self, x, time):
+        orig_x = x
+        t = self.time_mlp(time) if exists(self.time_mlp) else None
+
+        h = []
+
+        for convnext, convnext2, attn, downsample in self.downs:
+            x = convnext(x, t)
+            x = convnext2(x, t)
+            x = attn(x)
+            h.append(x)
+            x = downsample(x)
+
+        x = self.mid_block1(x, t)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, t)
+
+        for convnext, convnext2, attn, upsample in self.ups:
+            x = torch.cat((x, h.pop()), dim=1)
+            x = convnext(x, t)
+            x = convnext2(x, t)
+            x = attn(x)
+            x = upsample(x)
+
+        if self.residual:
+            return self.final_conv(x) + orig_x
+
+        return self.final_conv(x)
+
+class SuperResolutionDiffusion(nn.Module):
+    def __init__(
+        self,
+        denoise_fn,
+        *,
+        image_size,
+        device_of_kernel,
+        channels = 3,
+        timesteps = 3,  
+        loss_type = 'l1',
+        train_routine = 'Final',
+        sampling_routine='x0_step_down'  
+    ):
+        super().__init__()
+        self.channels = channels
+        self.image_size = image_size
+        self.denoise_fn = denoise_fn
+        self.device_of_kernel = device_of_kernel
+
+        self.num_timesteps = int(timesteps)
+        self.loss_type = loss_type
+        self.train_routine = train_routine
+        self.sampling_routine = sampling_routine
+        
+        # need steps for downsamping
+        self.min_size = 4  
+        self.num_downsamples = int(math.log2(image_size // self.min_size))
+        
+        # scales for timestep
+        self.scale_factors = self.get_scale_factors()
+        
+        print(f"Super Resolution Diffusion: Image size: {image_size}, Min size: {self.min_size}")
+        print(f"Number of downsampling steps: {self.num_downsamples}")
+        print(f"Scale factors: {self.scale_factors}")
+
+    def get_scale_factors(self):
+        """make scale schedule"""
+        factors = []
+        for t in range(self.num_timesteps):
+            if t == 0:
+                # mild downsample first
+                scale = 1.0 / 2.0  
+            else:
+                # more aggressive later
+                scale = 1.0 / (2.0 * (t + 1)) 
+                
+            factors.append(scale)
+        return factors
+
+    def q_sample(self, x_start, t):
+        """downsample based on t"""
+        if isinstance(t, int):
+            return self.downsample_step(x_start, t)
+        
+        results = []
+        for i, timestep in enumerate(t):
+            results.append(self.downsample_step(x_start[i:i+1], timestep))
+        
+        return torch.cat(results, dim=0)
+
+    def downsample_step(self, x, t):
+        """downsample for timestep t"""
+        b, c, h, w = x.shape
+        
+        # get scale
+        if t >= len(self.scale_factors):
+            t = len(self.scale_factors) - 1
+        
+        scale = self.scale_factors[t]
+        
+        # target size
+        tgt_h = max(int(h * scale), 1)
+        tgt_w = max(int(w * scale), 1)
+        
+        # downsample
+        down = F.interpolate(x, size=(tgt_h, tgt_w), mode='nearest')
+        
+        # back to original size
+        up = F.interpolate(down, size=(h, w), mode='nearest')
+        
+        return up
+
+    def p_losses(self, x_start, t):
+        """training loss calc"""
+        x_noisy = self.q_sample(x_start=x_start, t=t)
+        x_recon = self.denoise_fn(x_noisy, t)
+        
+        if self.loss_type == 'l1':
+            loss = (x_start - x_recon).abs().mean()
+        elif self.loss_type == 'l2':
+            loss = F.mse_loss(x_start, x_recon)
+        else:
+            raise NotImplementedError()
+            
+        return loss
+
+    def forward(self, x, *args, **kwargs):
+        """train forward"""
+        b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        return self.p_losses(x, t, *args, **kwargs)
+
+    @torch.no_grad()
+    def sample(self, batch_size=16, img=None, t=None):
+        """sample using alg 2"""
+        self.denoise_fn.eval()
+
+        if t is None:
+            t = self.num_timesteps
+
+        # downsample first
+        xt = self.downsample_step(img, t-1)
+        direct_recons = None
+
+        # iterative restore
+        curr_img = xt.clone()
+        
+        while(t):
+            step = torch.full((batch_size,), t - 1, dtype=torch.long).to(img.device)
+            x0_pred = self.denoise_fn(curr_img, step)  # predict clean
+
+            if direct_recons is None:
+                direct_recons = x0_pred.clone()
+
+            if self.sampling_routine == 'x0_step_down':
+                # alg 2
+                x_t = self.downsample_step(x0_pred, t-1)
+                x_t_minus_1 = self.downsample_step(x0_pred, t-2) if t > 1 else x0_pred
+                
+                # key step from paper
+                curr_img = curr_img - x_t + x_t_minus_1
+            
+            elif self.sampling_routine == 'default':
+                # alg 1
+                if t > 1:
+                    curr_img = self.downsample_step(x0_pred, t-2)
+                else:
+                    curr_img = x0_pred
+
+            t = t - 1
+
+        self.denoise_fn.train()
+        return xt, direct_recons, curr_img
+
+class Dataset(data.Dataset):
+    def __init__(self, folder, image_size, exts=['jpg', 'jpeg', 'png']):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+
+        self.transform = transforms.Compose([
+            transforms.Resize((int(image_size*1.12), int(image_size*1.12))),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Lambda(lambda t: (t * 2) - 1)  # Scale to [-1, 1]
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        return self.transform(img)
+
+def calculate_metrics(orig_imgs, recon_imgs):
+    orig_np = (orig_imgs.cpu().permute(0, 2, 3, 1) + 1) / 2
+    recon_np = (recon_imgs.cpu().permute(0, 2, 3, 1) + 1) / 2
+
+    # ssim
+    ssim_vals = []
+    for i in range(orig_np.shape[0]):
+        orig = orig_np[i].numpy()
+        recon = recon_np[i].numpy()
+
+        if orig.shape[2] == 1:
+            orig = orig.squeeze(2)
+            recon = recon.squeeze(2)
+            ssim_val = ssim(orig, recon, data_range=1.0, win_size=5, channel_axis=None)
+        else:
+            ssim_val = ssim(orig, recon, data_range=1.0, win_size=5, channel_axis=2)
+
+        ssim_vals.append(ssim_val)
+
+    avg_ssim = np.mean(ssim_vals)
+
+    # rmse
+    mse = F.mse_loss(orig_imgs, recon_imgs).item()
+    rmse = np.sqrt(mse)
+
+    # fid stuff
+    tmp_orig = 'temp_orig'
+    tmp_recon = 'temp_recon'
+    os.makedirs(tmp_orig, exist_ok=True)
+    os.makedirs(tmp_recon, exist_ok=True)
+
+    # save images for fid
+    for i in range(min(orig_imgs.shape[0], 100)):
+        utils.save_image((orig_imgs[i] + 1) / 2, os.path.join(tmp_orig, f'{i}.png'))
+        utils.save_image((recon_imgs[i] + 1) / 2, os.path.join(tmp_recon, f'{i}.png'))
+
+    # calc fid
+    fid = fid_score.calculate_fid_given_paths([tmp_orig, tmp_recon],
+                                   batch_size=50, device=orig_imgs.device,
+                                   dims=2048)
+    # cleanup
+    shutil.rmtree(tmp_orig)
+    shutil.rmtree(tmp_recon)
+
+    return avg_ssim, rmse, fid
+
+class Trainer(object):
+    def __init__(
+        self,
+        diffusion_model,
+        dataset_type,
+        *,
+        ema_decay = 0.995,
+        image_size = 32,
+        train_batch_size = 32,
+        eval_batch_size = 16,
+        train_lr = 2e-5,
+        train_num_steps = 100000,
+        gradient_accumulate_every = 2,
+        step_start_ema = 2000,
+        update_ema_every = 10,
+        save_and_sample_every = 1000,
+        results_folder = './results',
+        load_path = None,
+        eval_dataset = None,
+        save_model_every = 10000,
+        eval_every = 10000
+    ):
+        super().__init__()
+        self.model = diffusion_model
+        self.ema = EMA(ema_decay)
+        self.ema_model = copy.deepcopy(self.model)
+        self.update_ema_every = update_ema_every
+
+        self.step_start_ema = step_start_ema
+        self.save_and_sample_every = save_and_sample_every
+        self.save_model_every = save_model_every
+        self.eval_every = eval_every
+
+        self.batch_size = train_batch_size
+        self.eval_batch_size = eval_batch_size
+        self.image_size = image_size
+        self.gradient_accumulate_every = gradient_accumulate_every
+        self.train_num_steps = train_num_steps
+
+        self.dataset_type = dataset_type
+        self.setup_dataset(dataset_type)
+
+        self.eval_dataset = eval_dataset
+        if eval_dataset is None:
+            # use training subset
+            eval_size = min(1000, len(self.ds))
+            eval_indices = np.random.choice(len(self.ds), eval_size, replace=False)
+            self.eval_dataset = torch.utils.data.Subset(self.ds, eval_indices)
+
+        self.eval_dl = data.DataLoader(self.eval_dataset, batch_size=eval_batch_size,
+                                    shuffle=False, drop_last=False)
+
+        self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
+        self.step = 0
+
+        self.results_folder = Path(results_folder)
+        self.results_folder.mkdir(exist_ok=True, parents=True)
+
+        # metrics file
+        self.metrics_file = self.results_folder / 'metrics.csv'
+        if not self.metrics_file.exists():
+            with open(self.metrics_file, 'w') as f:
+                f.write('step,ssim,rmse,fid\n')
+
+        self.reset_parameters()
+
+        if load_path is not None:
+            self.load(load_path)
+
+    def setup_dataset(self, dataset_type):
+        if dataset_type == 'mnist':
+            transform = transforms.Compose([
+                transforms.Pad(2),  
+                transforms.ToTensor(),
+                transforms.Lambda(lambda t: (t * 2) - 1)  
+            ])
+
+            # get mnist
+            self.ds = MNIST(root='./data', train=True, download=True, transform=transform)
+            self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True,
+                                        pin_memory=True, num_workers=8, drop_last=True))
+
+        elif dataset_type == 'cifar10':
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Lambda(lambda t: (t * 2) - 1)  
+            ])
+
+            # get cifar
+            self.ds = CIFAR10(root='./data', train=True, download=True, transform=transform)
+            self.dl = cycle(data.DataLoader(self.ds, batch_size=self.batch_size, shuffle=True,
+                                        pin_memory=True, num_workers=8, drop_last=True))
+
+
+    def reset_parameters(self):
+        self.ema_model.load_state_dict(self.model.state_dict())
+
+    def step_ema(self):
+        if self.step < self.step_start_ema:
+            self.reset_parameters()
+            return
+        self.ema.update_model_average(self.ema_model, self.model)
+
+    def save(self, milestone=None):
+        data = {
+            'step': self.step,
+            'model': self.model.state_dict(),
+            'ema': self.ema_model.state_dict()
+        }
+        if milestone is None:
+            torch.save(data, str(self.results_folder / f'model.pt'))
+        else:
+            torch.save(data, str(self.results_folder / f'model_{milestone}.pt'))
+
+    def load(self, load_path):
+        print(f"Loading model from {load_path}")
+        data = torch.load(load_path)
+
+        self.step = data['step']
+        self.model.load_state_dict(data['model'])
+        self.ema_model.load_state_dict(data['ema'])
+
+    def evaluate(self):
+        """eval on test set"""
+        self.ema_model.eval()
+
+        all_orig_imgs = []
+        all_downsampled_imgs = []
+        all_direct_recons = []
+        all_upsampled_imgs = []
+
+        with torch.no_grad():
+            for batch in self.eval_dl:
+                if isinstance(batch, (list, tuple)):
+                    # handle (img, label)
+                    orig_imgs = batch[0].to(self.model.device_of_kernel)
+                else:
+                    # handle just img
+                    orig_imgs = batch.to(self.model.device_of_kernel)
+
+                # use model for SR
+                downsampled_imgs, direct_recons, upsampled_imgs = self.ema_model.sample(
+                    batch_size=orig_imgs.shape[0], img=orig_imgs)
+
+                all_orig_imgs.append(orig_imgs)
+                all_downsampled_imgs.append(downsampled_imgs)
+                all_direct_recons.append(direct_recons)
+                all_upsampled_imgs.append(upsampled_imgs)
+
+                # limit to 100 imgs
+                if len(all_orig_imgs) * self.eval_batch_size >= 100:
+                    break
+
+        # cat everything
+        orig_imgs = torch.cat(all_orig_imgs, dim=0)
+        downsampled_imgs = torch.cat(all_downsampled_imgs, dim=0)
+        direct_recons = torch.cat(all_direct_recons, dim=0)
+        upsampled_imgs = torch.cat(all_upsampled_imgs, dim=0)
+
+        # direct recon metrics
+        direct_ssim, direct_rmse, direct_fid = calculate_metrics(orig_imgs, direct_recons)
+
+        # alg 2 metrics
+        upsampled_ssim, upsampled_rmse, upsampled_fid = calculate_metrics(orig_imgs, upsampled_imgs)
+
+        # baseline metrics
+        downsampled_ssim, downsampled_rmse, downsampled_fid = calculate_metrics(orig_imgs, downsampled_imgs)
+
+        # results dict
+        metrics = {
+            'direct': {'ssim': direct_ssim, 'rmse': direct_rmse, 'fid': direct_fid},
+            'upsampled': {'ssim': upsampled_ssim, 'rmse': upsampled_rmse, 'fid': upsampled_fid},
+            'downsampled': {'ssim': downsampled_ssim, 'rmse': downsampled_rmse, 'fid': downsampled_fid}
+        }
+
+        # log to file
+        with open(self.metrics_file, 'a') as f:
+            f.write(f"{self.step},{upsampled_ssim},{upsampled_rmse},{upsampled_fid}\n")
+
+        # make pictures
+        vis_folder = self.results_folder / f"eval_{self.step}"
+        vis_folder.mkdir(exist_ok=True)
+
+        # save imgs
+        n_samples = min(8, orig_imgs.shape[0])
+        samples = torch.stack([
+            orig_imgs[:n_samples],
+            downsampled_imgs[:n_samples],
+            direct_recons[:n_samples],
+            upsampled_imgs[:n_samples]
+        ])
+        samples = (samples + 1) / 2  # [0, 1] range
+
+        # grid: diff samples in rows
+        grid = utils.make_grid(samples.view(-1, *samples.shape[2:]), nrow=n_samples)
+        utils.save_image(grid, vis_folder / 'samples.png')
+
+        # plot metrics
+        if self.step > 0:
+            self.plot_metrics()
+
+        print(f"Eval at step {self.step}:")
+        print(f"Direct recon: SSIM={direct_ssim:.4f}, RMSE={direct_rmse:.4f}, FID={direct_fid:.2f}")
+        print(f"Super-Res (Alg 2): SSIM={upsampled_ssim:.4f}, RMSE={upsampled_rmse:.4f}, FID={upsampled_fid:.2f}")
+
+        return metrics
+
+    def plot_metrics(self):
+        """plot stuff over time"""
+        import pandas as pd
+        import matplotlib.pyplot as plt
+
+        df = pd.read_csv(self.metrics_file)
+
+        fig, axs = plt.subplots(1, 3, figsize=(18, 5))
+
+        # ssim plot
+        axs[0].plot(df['step'], df['ssim'])
+        axs[0].set_title('SSIM over time (higher=better)')
+        axs[0].set_xlabel('Training steps')
+        axs[0].set_ylabel('SSIM')
+
+        # rmse plot
+        axs[1].plot(df['step'], df['rmse'])
+        axs[1].set_title('RMSE over time (lower=better)')
+        axs[1].set_xlabel('Training steps')
+        axs[1].set_ylabel('RMSE')
+
+        # fid plot
+        axs[2].plot(df['step'], df['fid'])
+        axs[2].set_title('FID over time (lower=better)')
+        axs[2].set_xlabel('Training steps')
+        axs[2].set_ylabel('FID')
+
+        plt.tight_layout()
+        plt.savefig(self.results_folder / 'metrics_plot.png')
+        plt.close()
+
+    def train(self):
+        """train the model"""
+        device = self.model.device_of_kernel
+
+        acc_loss = 0
+        while self.step < self.train_num_steps:
+            uloss = 0
+            for i in range(self.gradient_accumulate_every):
+                # get batch
+                if self.dataset_type in ['mnist', 'cifar10']:
+                    # handle (img, label)
+                    data, _ = next(self.dl)
+                    data = data.to(device)
+                else:
+                    # handle just imgs
+                    data = next(self.dl).to(device)
+
+                # forward
+                loss = torch.mean(self.model(data))
+                if self.step % 100 == 0:
+                    print(f'Step {self.step}: Loss = {loss.item():.6f}')
+
+                uloss += loss.item()
+
+                # backward with grad accum
+                loss = loss / self.gradient_accumulate_every
+                loss.backward()
+
+            # update
+            self.opt.step()
+            self.opt.zero_grad()
+
+            # track avg loss
+            acc_loss = acc_loss + (uloss / self.gradient_accumulate_every)
+
+            # ema update
+            if self.step % self.update_ema_every == 0:
+                self.step_ema()
+
+            # save stuff and metrics
+            if self.step != 0 and self.step % self.save_and_sample_every == 0:
+                milestone = self.step // self.save_and_sample_every
+                print(f"\nSaving samples at step {self.step}")
+
+                # get imgs for viz
+                if self.dataset_type in ['mnist', 'cifar10']:
+                    viz_batch, _ = next(self.dl)
+                    viz_batch = viz_batch.to(device)
+                else:
+                    viz_batch = next(self.dl).to(device)
+
+                # sample w/ ema
+                with torch.no_grad():
+                    downsampled, direct_recons, upsampled = self.ema_model.sample(
+                        batch_size=viz_batch.shape[0], img=viz_batch)
+
+                # save imgs
+                viz_folder = self.results_folder / f"samples_{self.step}"
+                viz_folder.mkdir(exist_ok=True)
+
+                # [0,1] range for viz
+                viz_batch = (viz_batch + 1) * 0.5
+                downsampled = (downsampled + 1) * 0.5
+                direct_recons = (direct_recons + 1) * 0.5
+                upsampled = (upsampled + 1) * 0.5
+
+                # grid + save
+                grid = torch.cat([
+                    viz_batch[:8],
+                    downsampled[:8],
+                    direct_recons[:8],
+                    upsampled[:8]
+                ])
+                utils.save_image(grid, viz_folder / 'grid.png', nrow=8)
+
+                # individual imgs
+                utils.save_image(viz_batch[:8], viz_folder / 'original.png', nrow=4)
+                utils.save_image(downsampled[:8], viz_folder / 'downsampled.png', nrow=4)
+                utils.save_image(direct_recons[:8], viz_folder / 'direct_recons.png', nrow=4)
+                utils.save_image(upsampled[:8], viz_folder / 'upsampled.png', nrow=4)
+
+                # print avg loss
+                avg_loss = acc_loss / (self.save_and_sample_every)
+                print(f'Avg loss (last {self.save_and_sample_every} steps): {avg_loss:.6f}')
+                acc_loss = 0
+
+            # save checkpoint
+            if self.step != 0 and self.step % self.save_model_every == 0:
+                self.save(self.step)
+                print(f"Model saved at step {self.step}")
+
+            # eval model
+            if self.step != 0 and self.step % self.eval_every == 0:
+                print(f"\nEvaluating at step {self.step}")
+                self.evaluate()
+
+            self.step += 1
+
+        # final stuff
+        self.save()
+        self.evaluate()
+        print('Training done!')
+
+# Run main
+args = type('Args', (), {
+    'dataset': 'cifar10',  # mnist or cifar10
+    'batch_size': 32,
+    'eval_batch_size': 16,
+    'epochs': 50,
+    'save_every': 10000,
+    'eval_every': 10000,
+    'sample_every': 1000,
+    'results_dir': f"{res_dir}",
+    'load_model': '/content/drive/MyDrive/Project/super_cifar10/model_170000.pt',  
+    'train': True,
+    'eval': True
+})()
+
+# device setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# setup config
+if args.dataset == 'mnist':
+    channels = 1
+    image_size = 32  
+    model_dim = 64
+    timesteps = 3  
+elif args.dataset == 'cifar10':
+    channels = 3
+    image_size = 32
+    model_dim = 64
+    timesteps = 3  
+
+# make results dir
+results_dir = Path(args.results_dir) / f"super_{args.dataset}"
+results_dir.mkdir(exist_ok=True, parents=True)
+
+# make model
+model = Unet(
+    dim=model_dim,
+    channels=channels,
+    dim_mults=(1, 2, 4, 8),
+    with_time_emb=True
+).to(device)
+
+# make diffusion
+diffusion = SuperResolutionDiffusion(
+    model,
+    image_size=image_size,
+    device_of_kernel=device,
+    channels=channels,
+    timesteps=timesteps,
+    loss_type='l1',
+    train_routine='Final',
+    sampling_routine='x0_step_down'  # use alg 2
+).to(device)
+
+total_steps = 200000
+
+# make trainer
+trainer = Trainer(
+    diffusion,
+    args.dataset,
+    image_size=image_size,
+    train_batch_size=args.batch_size,
+    eval_batch_size=args.eval_batch_size,
+    train_lr=2e-5,
+    train_num_steps=total_steps,
+    save_and_sample_every=args.sample_every,
+    save_model_every=args.save_every,
+    eval_every=args.eval_every,
+    results_folder=results_dir,
+    load_path=args.load_model
+)
+
+if args.train:
+    print(f"Starting training: {args.epochs} epochs ({total_steps} steps)...")
+    trainer.train()
+
+if args.eval:
+    print("Evaluating model...")
+    trainer.evaluate()
