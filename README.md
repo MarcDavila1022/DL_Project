@@ -10,7 +10,7 @@ This repository contains our re-implementation of *Cold Diffusion: Inverting Arb
 We focus on reproducing **Algorithm 2** of the paper, which is mathematically proven to achieve high-quality reconstructions even when the restoration operator is imperfect. We use this in our validation of the inversion of deterministic degradations on MNIST and CFAR-10, such as:
 - Deblurring
 - Super-resolution
-- Inpainting
+- Inpainting (proof of concept only)
 
 For reference, see Figure 3 (Deblurring), Figure 5 (Super-resolution), and Figure 4 (Inpainting) in the original paper.  
 
