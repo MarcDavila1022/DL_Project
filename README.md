@@ -38,7 +38,11 @@ We initially attempted to recreate the model from scratch but later referenced t
 The most notable changes is the decrease in training steps from 700,000 to 200,000 for deblurring and super-resolution, and 5,000 for inpainting.
 
 ## Reproduction Steps
-We suggest using Google Colab as well. Thus, download the `.ipynb` files from the `./code/` folder, and open them in Google Colab. Make sure to use A100 GPUs if you can. Running all the cells should work out of the box, as it will install all necessary dependencies and pull the datasets from the web.
+We suggest using Google Colab as well. Thus, download the `.ipynb` files from the `./code/` folder, and open them in Google Colab. Make sure to use A100 GPUs if you can. Running all the cells should work out of the box, as it will install all necessary dependencies and pull the datasets from the web. Please make sure to download this:
+!pip install torch torchvision torchmetrics torch-fidelity numpy matplotlib scikit-image
+!pip install pytorch-fid  # For FID calculation
+!pip install tqdm
+!pip install -q kornia tqdm einops
 
 ## Results
 Our reimplementation successfully inverts several deterministic degradations, confirming the core claims of the paper. Although our results are promising, they fall short of the paper's reported FID, SSIM, and RMSE metrics due to limited training steps (200K vs. 700K). We anticipate that extending training would bridge this gap.
